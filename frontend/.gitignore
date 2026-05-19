@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Vite build
+dist/
+dist-ssr/
+
+# Local env (VITE_* vars)
+.env
+.env.*
+!.env.example
+.env.local
+.env.*.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Vite cache
+.vite/
+
+# TypeScript
+*.tsbuildinfo
+
+# Test / coverage
+coverage/

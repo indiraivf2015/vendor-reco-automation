@@ -1,0 +1,37 @@
+# Dependencies
+node_modules/
+
+# Build output (NestJS)
+dist/
+build/
+
+# Environment & secrets
+.env
+.env.*
+!.env.example
+
+# Local DB / POC artifacts
+*.sqlite
+*.sqlite-journal
+
+# Upload temp dir (multer → tmp-uploads)
+tmp-uploads/
+
+# Logs & debug
+logs/
+*.log
+npm-debug.log*
+
+# Test / coverage
+coverage/
+.nyc_output/
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# TypeScript
+*.tsbuildinfo
