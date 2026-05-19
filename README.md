@@ -77,37 +77,33 @@ entry: PAN, GST, MSME) by collapsing them into a single record per vendor code.
 | GET    | /api/vendors/stats                | P2P + ERP vendor counts            |
 | GET    | /api/audit                        | Audit trail                        |
 
-## Production Deployment (AWS EC2)
+## Production Deployment (EC2 / Linux)
+
+Domain: **https://autoreco.indiraivf.in** — API on port **8001**.
+
+| File | Purpose |
+|------|---------|
+| `ecosystem.config.cjs` | PM2 process for NestJS API |
+| `deploy/nginx/autoreco.indiraivf.in.conf` | Nginx HTTP→HTTPS, static SPA, `/api/` proxy |
+| `deploy/setup.sh` | Build + PM2 + nginx enable (one-time) |
 
 ```bash
-# Backend
-cd backend
-npm run build
-pm2 start dist/main.js --name vendor-recon-api
+# From repo root on the server
+chmod +x deploy/setup.sh
+./deploy/setup.sh
 
-# Frontend
-cd frontend
-npm run build
-# Serve dist/ via Nginx or S3+CloudFront
+# Or manually:
+cd backend && npm ci && npm run build && cd ..
+cd frontend && npm ci && npm run build && cd ..
+pm2 start ecosystem.config.cjs
+pm2 save && pm2 startup
+
+sudo cp deploy/nginx/autoreco.indiraivf.in.conf /etc/nginx/sites-available/
+sudo ln -sf /etc/nginx/sites-available/autoreco.indiraivf.in.conf /etc/nginx/sites-enabled/
+sudo nginx -t && sudo systemctl reload nginx
 ```
 
-Nginx config mirrors the existing Ticketing Tool pattern:
-```nginx
-server {
-    listen 80;
-    server_name vendorrecon.indiraivf.in;
-
-    location /api/ {
-        proxy_pass http://127.0.0.1:3001;
-        proxy_http_version 1.1;
-    }
-
-    location / {
-        root /var/www/vendor-recon/frontend/dist;
-        try_files $uri $uri/ /index.html;
-    }
-}
-```
+Set `PORT=8001` in `backend/.env`. Update the `root` path in the nginx file if the repo is not at `/home/aiadmin/vendor_latest`.
 
 ## Environment Variables
 
