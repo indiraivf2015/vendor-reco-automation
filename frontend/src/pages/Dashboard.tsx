@@ -1,17 +1,41 @@
-import { useEffect } from 'react';
-import { Link } from 'react-router-dom';
+import { useEffect, useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { dashboardApi, reconApi, reportsApi, DashboardData } from '../services/api';
+import { labelToType } from '../services/categoryTypes';
 import { Card, Button, PageHeader, StatusBadge, DashboardSkeleton } from '../components/ui';
 import { Play, Download, TrendingUp, AlertTriangle, Users, GitCompare, Loader2 } from 'lucide-react';
 import { useActiveJobs } from '../hooks/useActiveJobs';
 import { LineChart, Line, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid } from 'recharts';
 import { format } from 'date-fns';
+import { toast } from '../components/Toast';
 
 export default function Dashboard() {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const { activeJobs, recentlyCompleted } = useActiveJobs();
   const { data, isLoading } = useQuery<DashboardData>({ queryKey: ['dashboard'], queryFn: dashboardApi.get });
+  const [downloadingLatest, setDownloadingLatest] = useState(false);
+
+  function openCategory(category: string) {
+    const type = labelToType(category);
+    if (!type) return;
+    navigate(`/exceptions?type=${encodeURIComponent(type)}`);
+  }
+
+  async function handleDownloadLatest() {
+    if (downloadingLatest) return;
+    setDownloadingLatest(true);
+    toast.info('Generating Excel report… large runs can take 30–90 seconds.');
+    try {
+      const filename = await reportsApi.downloadLatest();
+      toast.success(`Downloaded ${filename}`);
+    } catch (e: any) {
+      toast.error(e?.message || 'Report download failed. Try again or check server logs.');
+    } finally {
+      setDownloadingLatest(false);
+    }
+  }
 
   useEffect(() => {
     if (recentlyCompleted.length > 0) {
@@ -39,8 +63,13 @@ export default function Dashboard() {
   return (
     <div>
       <PageHeader eyebrow="P2P ↔ Oracle ERP" title="Reconciliation Dashboard">
-        <Button variant="secondary" onClick={() => reportsApi.downloadLatest()} size="sm">
-          <Download className="w-3.5 h-3.5" /> Report
+        <Button variant="secondary" onClick={handleDownloadLatest} disabled={downloadingLatest} size="sm">
+          {downloadingLatest ? (
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+          ) : (
+            <Download className="w-3.5 h-3.5" />
+          )}
+          {downloadingLatest ? 'Generating…' : 'Report'}
         </Button>
         <Button onClick={() => runMutation.mutate()} disabled={runMutation.isPending} size="sm">
           <Play className="w-3.5 h-3.5" /> {runMutation.isPending ? 'Running...' : 'Run Recon'}
@@ -123,21 +152,50 @@ export default function Dashboard() {
               </tr>
             </thead>
             <tbody>
-              {d.categorySummary.map((s, i) => (
-                <tr key={s.category} className={i % 2 === 0 ? 'bg-white' : 'bg-cream-50'}>
-                  <td className="px-4 py-2.5 font-medium text-ink-800">{s.category}</td>
-                  <td className="px-4 py-2.5 text-right font-mono">
-                    <span className={s.missingCount > 0 ? 'text-red-600 font-bold' : 'text-green-600'}>
-                      {s.missingCount}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2.5 text-right font-mono text-green-600">{s.matched}</td>
-                  <td className="px-4 py-2.5 text-right font-mono text-ink-500">{s.p2pUnique}</td>
-                  <td className="px-4 py-2.5 text-right font-mono text-ink-500">{s.erpUnique}</td>
-                  <td className="px-4 py-2.5 text-right font-mono text-orange-500">{s.p2pMissing}</td>
-                  <td className="px-4 py-2.5 text-right font-mono text-orange-500">{s.erpMissing}</td>
-                </tr>
-              ))}
+              {d.categorySummary.map((s, i) => {
+                const drillable = labelToType(s.category) !== null;
+                const baseRowClass = i % 2 === 0 ? 'bg-white' : 'bg-cream-50';
+                const interactiveClass = drillable
+                  ? 'cursor-pointer hover:bg-accent-50/60 focus:bg-accent-50/60 focus:outline-none focus:ring-2 focus:ring-inset focus:ring-accent-400 transition-colors'
+                  : '';
+                return (
+                  <tr
+                    key={s.category}
+                    className={`${baseRowClass} ${interactiveClass}`.trim()}
+                    onClick={drillable ? () => openCategory(s.category) : undefined}
+                    onKeyDown={
+                      drillable
+                        ? (e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault();
+                              openCategory(s.category);
+                            }
+                          }
+                        : undefined
+                    }
+                    role={drillable ? 'button' : undefined}
+                    tabIndex={drillable ? 0 : undefined}
+                    title={drillable ? `Click to view all ${s.category} mismatches` : undefined}
+                    aria-label={
+                      drillable
+                        ? `View ${s.category} mismatches (${s.missingCount})`
+                        : undefined
+                    }
+                  >
+                    <td className="px-4 py-2.5 font-medium text-ink-800">{s.category}</td>
+                    <td className="px-4 py-2.5 text-right font-mono">
+                      <span className={s.missingCount > 0 ? 'text-red-600 font-bold' : 'text-green-600'}>
+                        {s.missingCount}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2.5 text-right font-mono text-green-600">{s.matched}</td>
+                    <td className="px-4 py-2.5 text-right font-mono text-ink-500">{s.p2pUnique}</td>
+                    <td className="px-4 py-2.5 text-right font-mono text-ink-500">{s.erpUnique}</td>
+                    <td className="px-4 py-2.5 text-right font-mono text-orange-500">{s.p2pMissing}</td>
+                    <td className="px-4 py-2.5 text-right font-mono text-orange-500">{s.erpMissing}</td>
+                  </tr>
+                );
+              })}
               {d.categorySummary.length === 0 && (
                 <tr><td colSpan={7} className="px-4 py-8 text-center text-ink-400">No reconciliation data yet. Upload vendor files or run a reconciliation.</td></tr>
               )}

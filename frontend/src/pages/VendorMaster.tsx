@@ -25,6 +25,7 @@ const FIELDS = [
   { label: 'Bank Account', p2p: 'bankAccountP2p', erp: 'bankAccountErp', match: 'bankAccountMatch' },
   { label: 'Bank Name', p2p: 'bankNameP2p', erp: 'bankNameErp', match: 'bankNameMatch' },
   { label: 'TDS', p2p: 'tdsP2p', erp: 'tdsErp', match: 'tdsMatch' },
+  { label: 'Payment Term', p2p: 'paymentTermP2p', erp: 'paymentTermErp', match: 'paymentTermMatch' },
 ] as const;
 
 const DETAIL_FIELDS = [VENDOR_NAME_FIELD, ...FIELDS] as const;

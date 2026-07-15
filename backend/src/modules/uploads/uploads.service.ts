@@ -11,6 +11,7 @@ import {
   ERP_COLUMN_ALIASES,
   P2P_COLUMN_ALIASES,
   matchesStatutoryP2p,
+  normalizeHeaderLabel,
   resolveAllColumns,
 } from './column-mappings';
 
@@ -80,7 +81,6 @@ const P2P_LEGACY_ALIASES: Record<string, string[]> = {
   vendorType: ['Vendor Type', 'VendorType'],
   vendorCategory: ['Vendor Category'],
   vendorGroup: ['Vendor Group'],
-  payTerm: ['PayTerm', 'Pay Term', 'Payment Term'],
   residentStatus: ['Resident Status'],
   applicantType: ['Applicant Type'],
   hold: ['Hold'],
@@ -108,7 +108,6 @@ const ERP_LEGACY_ALIASES: Record<string, string[]> = {
   address: ['ADDRESS1', 'ADDRESS1_S', 'ADDRESS', 'Address'],
   postalCode: ['POSTAL_CODE', 'POSTAL_CODE_S', 'PINCODE'],
   country: ['COUNTRY', 'COUNTRY_S'],
-  paymentTerm: ['PAYMENT_TERM', 'PAYMENT_TERM_S', 'PAYMENT_TERMS', 'Payment Term'],
   email: ['EMAIL_ADDRESS', 'EMAIL_ADDRESS_S', 'EMAIL', 'Email'],
 };
 
@@ -160,8 +159,11 @@ export class UploadsService {
     try {
       this.jobsSvc.updateProgress(jobId, { status: 'PARSING' });
 
-      // Phase 1: locate header row + detect source
-      const { headers, headerRowNum, sheetName } = await this.findHeaders(filePath);
+      // Phase 1: locate header row + detect source. dataSample is a small
+      // buffer of the first data rows used downstream for content-sniff
+      // column resolution (e.g. binding tdsSection by looking at actual values
+      // when the header text is just "TDS" or otherwise ambiguous).
+      const { headers, headerRowNum, sheetName, dataSample } = await this.findHeaders(filePath);
       this.logger.log(`📋 Job ${jobId.slice(0, 8)}: headers found on "${sheetName}" row ${headerRowNum}`);
 
       const source = declaredSource || this.detectSource(headers);
@@ -180,7 +182,7 @@ export class UploadsService {
       }
 
       // Phase 3: chunked stream + progressive insights
-      const { map: colMap, warnings: columnWarnings, verifiedCanonical } = this.resolveColumns(headers, source);
+      const { map: colMap, warnings: columnWarnings, verifiedCanonical } = this.resolveColumns(headers, source, dataSample);
       this.jobsSvc.updateProgress(jobId, {
         columnWarnings,
         ...(source === 'P2P'
@@ -226,21 +228,119 @@ export class UploadsService {
 
   // ─── Phase 1: header discovery ────────────────────────────────────────────
 
-  private async findHeaders(filePath: string): Promise<{ headers: string[]; headerRowNum: number; sheetName: string }> {
+  /**
+   * Locate the header row and (if needed) merge continuation rows.
+   *
+   * The Master Vendor P2P report ("VendorMasterReport") uses a multi-row header
+   * layout — e.g. column CM has "TDS" in row 10 and "Section" in row 11, which
+   * means the parser would only see "TDS" and either (a) miss the column entirely
+   * or (b) collide with a Yes/No flag column also literally named "TDS".
+   *
+   * Strategy:
+   *   1. Find the first row that contains a signature ("Vendor Code", etc.) — call this rowN.
+   *   2. Note which column holds the signature (signatureColIdx).
+   *   3. Peek at rowN+1, rowN+2, ...: if the signature column there is empty or
+   *      non-numeric (i.e., not a vendor code), treat it as a header continuation;
+   *      concatenate values into the composite headers.
+   *   4. Stop once we find a row whose signature-column value looks like data
+   *      (numeric, ≥4 chars), OR we've merged a hard maximum of 5 continuation rows.
+   *
+   * `headerRowNum` returned is the LAST header row (so streamChunked skips it
+   * correctly when reading data).
+   */
+  private async findHeaders(filePath: string): Promise<{
+    headers: string[];
+    headerRowNum: number;
+    sheetName: string;
+    dataSample: string[][];
+  }> {
     const wb = new ExcelJS.stream.xlsx.WorkbookReader(filePath, {
       sharedStrings: 'cache', worksheets: 'emit', hyperlinks: 'ignore',
     } as any);
 
+    const MAX_CONTINUATION_ROWS = 5;
+    // Sample size for content-sniff column resolution (e.g. binding tdsSection
+    // by looking at actual data when header text is ambiguous).
+    const MAX_SAMPLE_ROWS = 50;
+
     for await (const ws of wb as any) {
       const sheetName = ws.name || 'Sheet1';
       let rowCount = 0;
+      let composite: string[] | null = null;
+      let signatureRowNum = -1;
+      let signatureColIdx = -1;
+      let lastHeaderRowNum = -1;
+      let headerLocked = false;
+      const dataSample: string[][] = [];
+
       for await (const row of ws) {
         rowCount++;
-        if (rowCount > 100) break;
+        // Hard stop: searching for signature beyond 100 rows.
+        if (composite === null && rowCount > 100) break;
+        // Stop once we've collected enough data rows for content-sniff.
+        if (dataSample.length >= MAX_SAMPLE_ROWS) break;
+
         const cells = this.extractRowValues(row);
-        if (this.looksLikeHeader(cells)) {
-          return { headers: cells, headerRowNum: rowCount, sheetName };
+
+        // Phase 1: locate signature row.
+        if (composite === null) {
+          if (!this.looksLikeHeader(cells)) continue;
+
+          composite = [...cells];
+          signatureRowNum = rowCount;
+          lastHeaderRowNum = rowCount;
+
+          const lower = cells.map(c => c.toLowerCase().trim());
+          for (const sig of ANY_SIGNATURES) {
+            const idx = lower.indexOf(sig);
+            if (idx >= 0) { signatureColIdx = idx; break; }
+          }
+          continue;
         }
+
+        // Phase 2: continuation-row detection (active until headerLocked).
+        if (!headerLocked) {
+          if (rowCount - signatureRowNum > MAX_CONTINUATION_ROWS) {
+            headerLocked = true;
+          } else {
+            const sigVal = (cells[signatureColIdx] || '').trim();
+            // Data row signal: signature column has a long numeric value
+            // (typical vendor code). The current row is data, not a header.
+            if (sigVal && /^\d{4,}$/.test(sigVal)) {
+              headerLocked = true;
+              // Fall through to Phase 3 so this row is captured in dataSample.
+            } else {
+              // Continuation: merge this row's cells into composite headers.
+              const maxLen = Math.max(composite.length, cells.length);
+              for (let i = 0; i < maxLen; i++) {
+                const a = (composite[i] || '').trim();
+                const b = (cells[i] || '').trim();
+                composite[i] = a && b ? `${a} ${b}` : (a || b);
+              }
+              lastHeaderRowNum = rowCount;
+              continue;
+            }
+          }
+        }
+
+        // Phase 3: data-row sample collection (used by content-sniff).
+        dataSample.push(cells);
+      }
+
+      if (composite !== null) {
+        const merged = lastHeaderRowNum - signatureRowNum;
+        if (merged > 0) {
+          this.logger.log(
+            `🔗 Merged ${merged} continuation row(s) into header on "${sheetName}" ` +
+            `(rows ${signatureRowNum}..${lastHeaderRowNum})`,
+          );
+        }
+        return {
+          headers: composite,
+          headerRowNum: lastHeaderRowNum,
+          sheetName,
+          dataSample,
+        };
       }
     }
     throw new BadRequestException(
@@ -432,18 +532,27 @@ export class UploadsService {
       let withPan = 0;
       let withGst = 0;
       let withMsme = 0;
+      let withTdsCode = 0;
       for (const r of merged) {
         const pan = nPan(r.panNumber);
         if (pan && PAN_REGEX.test(pan)) withPan++;
         const gst = r.gstNumber ? String(r.gstNumber).trim().toUpperCase() : '';
         if (gst && GST_REGEX.test(gst)) withGst++;
         if (r.msmeNumber?.trim()) withMsme++;
+        // TDS: count rows whose tdsSection looks like a real code, excluding
+        // Yes/No/blank lookalike captures that would inflate the metric.
+        const tds = typeof r.tdsSection === 'string' ? r.tdsSection.trim() : '';
+        if (tds && tds.toLowerCase() !== 'yes' && tds.toLowerCase() !== 'no') {
+          withTdsCode++;
+        }
       }
       const total = merged.length;
       const pct = (x: number) => ((x / total) * 100).toFixed(1);
       this.logger.log(
         `[P2P] Coverage: PAN ${withPan}/${total} (${pct(withPan)}%), ` +
-          `GST ${withGst}/${total} (${pct(withGst)}%), MSME ${withMsme}/${total} (${pct(withMsme)}%)`,
+          `GST ${withGst}/${total} (${pct(withGst)}%), ` +
+          `MSME ${withMsme}/${total} (${pct(withMsme)}%), ` +
+          `TDS codes ${withTdsCode}/${total} (${pct(withTdsCode)}%) [excl. Yes/No]`,
       );
     }
 
@@ -638,16 +747,27 @@ export class UploadsService {
       approvalStatus: v('status'),
     };
 
+    // Direct-column path (new VendorMasterReport.xlsx — "PAN No." and "GST No."
+    // are real columns). Populated first; statutory-matrix fallback below only
+    // fills if the direct column is absent for this row/vendor.
+    const directPan = v('panNumber');
+    const directGst = v('gstNumber');
+    if (directPan) r.panNumber = nPan(directPan);
+    if (directGst) r.gstNumber = directGst;
+
+    // Statutory-matrix path (old Master Vendor P2P export — vendor data is
+    // spread across multiple rows tagged by a "Statutory Name" column). Each
+    // matrix row carries one identifier; guards ensure a direct-column value
+    // (when present) is never overwritten by a later matrix row.
     const statNameRaw = v('sname');
     const statVal = v('sval');
-    // One statutory type per row — scan every row via merge; independent checks (not else-if).
-    if (statVal && matchesStatutoryP2p(statNameRaw, 'pan')) {
+    if (statVal && !r.panNumber && matchesStatutoryP2p(statNameRaw, 'pan')) {
       r.panNumber = nPan(statVal);
     }
-    if (statVal && matchesStatutoryP2p(statNameRaw, 'gstin')) {
+    if (statVal && !r.gstNumber && matchesStatutoryP2p(statNameRaw, 'gstin')) {
       r.gstNumber = statVal;
     }
-    if (statVal && matchesStatutoryP2p(statNameRaw, 'msme')) {
+    if (statVal && !r.msmeNumber && matchesStatutoryP2p(statNameRaw, 'msme')) {
       r.msmeNumber = statVal;
     }
 
@@ -690,21 +810,33 @@ export class UploadsService {
 
   /**
    * Verified canonical columns (column-mappings.ts) + legacy alias resolution for remaining fields.
+   *
+   * @param dataSample First ~50 data rows (post-header) used for content-sniff
+   *                   column resolution where the header text alone is too
+   *                   ambiguous to bind a field (e.g. P2P TDS Section column
+   *                   whose row-10 cell value is literally "TDS" while a
+   *                   different "TDS" column elsewhere holds Yes/No flags).
    */
   private resolveColumns(
     headers: string[],
     source: 'P2P' | 'ERP',
+    dataSample: string[][] = [],
   ): { map: Record<string, number>; warnings: string[]; verifiedCanonical: Record<string, number> } {
     const essential = ESSENTIAL_FIELDS[source];
     const warnings: string[] = [];
     const legacyLogRows: string[] = [];
 
+    // P2P now resolves pan / gstin as DIRECT columns when present (new
+    // VendorMasterReport format has "PAN No." / "GST No." as real columns).
+    // When they're not present, mapP2pRow falls back to the statutory matrix.
+    // MSME stays matrix-only on P2P — the new file has no MSME column and we
+    // do not want a missing-field warning for it.
     const verified = resolveAllColumns(
       headers,
       source === 'P2P' ? P2P_COLUMN_ALIASES : ERP_COLUMN_ALIASES,
       source,
       this.logger,
-      source === 'P2P' ? { skipFields: ['pan', 'gstin', 'msme'] } : undefined,
+      source === 'P2P' ? { skipFields: ['msme'] } : undefined,
     );
 
     const verifiedCanonical = Object.fromEntries(
@@ -718,10 +850,16 @@ export class UploadsService {
       map.vendorName = verified.vendorName;
       map.city = verified.city;
       map.state = verified.state;
+      // Direct-column resolution for PAN / GSTIN (new file format). -1 if absent,
+      // in which case mapP2pRow falls back to the statutory matrix per row.
+      map.panNumber = verified.pan;
+      map.gstNumber = verified.gstin;
       map.bankAccount = verified.bankAccount;
       map.bankName = verified.bankName;
       map.ifscCode = verified.ifscCode;
       map.tds = verified.tdsSection;
+      // Canonical paymentTerm → row-mapper key 'payTerm' (P2P entity column kept as payTerm).
+      map.payTerm = verified.paymentTerm;
       for (const [field, aliases] of Object.entries(P2P_LEGACY_ALIASES)) {
         const r = resolveColumn(headers, aliases);
         map[field] = r.idx;
@@ -744,6 +882,7 @@ export class UploadsService {
       map.bankAccount = verified.bankAccount;
       map.bankName = verified.bankName;
       map.ifscCode = verified.ifscCode;
+      map.paymentTerm = verified.paymentTerm;
       for (const [field, aliases] of Object.entries(ERP_LEGACY_ALIASES)) {
         const r = resolveColumn(headers, aliases);
         map[field] = r.idx;
@@ -766,6 +905,165 @@ export class UploadsService {
     this.logger.log(
       `Legacy / extra column resolution (${source}):\n${legacyLogRows.join('\n')}`,
     );
+
+    // ─── P2P content-sniff for tdsSection ─────────────────────────────────
+    // P2P file formats vary: "TDS Section" / "TDS\nSection" / "TDSSection" /
+    // bare "TDS" / "Withholding Tax Section" / etc. The old Master Vendor
+    // file even has a separate Yes/No "TDS" column that previously collided
+    // with naive alias matching.
+    //
+    // Strategy: trust the alias resolver when it lands on a column whose data
+    // actually looks like TDS section codes. If the alias matched a Yes/No-
+    // dominated column (or matched nothing at all), scan every column and
+    // bind to the one whose first ~50 data values look like TDS codes.
+    // Yes/No-dominated columns are explicitly rejected.
+    if (source === 'P2P' && dataSample.length > 0) {
+      const TDS_CODE_REGEX = /^(393\(\d+\)_|19[0-9][A-Z]?(\([a-z]\))?|195[_ ])/i;
+      const TDS_FLAG_REGEX = /^(yes|no|none|n\/a|null|true|false)$/i;
+      const MIN_SNIFF_HITS = 3;
+
+      const scanColumn = (
+        colIdx: number,
+      ): { codeHits: number; flagHits: number; nonEmpty: number } => {
+        let codeHits = 0;
+        let flagHits = 0;
+        let nonEmpty = 0;
+        for (const r of dataSample) {
+          const cell = colIdx >= 0 && colIdx < r.length ? r[colIdx] : '';
+          const v = (cell || '').trim();
+          if (!v) continue;
+          nonEmpty++;
+          if (TDS_CODE_REGEX.test(v)) codeHits++;
+          else if (TDS_FLAG_REGEX.test(v)) flagHits++;
+        }
+        return { codeHits, flagHits, nonEmpty };
+      };
+
+      // (a) Diagnostic block — fires when the alias list returned NOT FOUND.
+      //     Dumps every header containing tds/section/with so we can see
+      //     exactly what raw text the file actually uses (line breaks,
+      //     trailing whitespace, non-breaking spaces, etc. visible via
+      //     JSON.stringify).
+      if (verified.tdsSection < 0) {
+        const candidates = headers
+          .map((h, i) => ({ idx: i, raw: h, normalized: normalizeHeaderLabel(h) }))
+          .filter(
+            (h) =>
+              h.normalized.includes('tds') ||
+              h.normalized.includes('section') ||
+              h.normalized.includes('with'),
+          );
+        const diagLines = candidates.length === 0
+          ? '  (no headers containing tds/section/with — file may use an unrelated label)'
+          : candidates
+              .map((h) => {
+                const beforeRaw = h.idx > 0 ? JSON.stringify(headers[h.idx - 1]) : '—';
+                const afterRaw = h.idx + 1 < headers.length ? JSON.stringify(headers[h.idx + 1]) : '—';
+                return (
+                  `  col ${String(h.idx + 1).padStart(3)}: ` +
+                  `raw=${JSON.stringify(h.raw)} norm="${h.normalized}"\n` +
+                  `      neighbours: col ${h.idx} raw=${beforeRaw} | ` +
+                  `col ${h.idx + 2} raw=${afterRaw}`
+                );
+              })
+              .join('\n');
+        this.logger.warn(
+          `[P2P][DIAG] tdsSection unmatched by alias list. ` +
+            `Candidate headers containing "tds"/"section"/"with":\n${diagLines}`,
+        );
+      } else {
+        // (b) Validate the alias-bound column. If its data is Yes/No-
+        //     dominated rather than TDS codes, reject and re-bind via sniff.
+        const { codeHits, flagHits } = scanColumn(verified.tdsSection);
+        if (flagHits > codeHits && flagHits >= MIN_SNIFF_HITS) {
+          this.logger.warn(
+            `[P2P] tdsSection alias bound col ${verified.tdsSection + 1} ` +
+              `("${headers[verified.tdsSection]}") but its data is ` +
+              `Yes/No-dominated (${flagHits} flags vs ${codeHits} codes); ` +
+              `re-binding via content-sniff`,
+          );
+          verified.tdsSection = -1;
+          map.tds = -1;
+          verifiedCanonical.tdsSection = -1;
+        }
+      }
+
+      // (c) Content-sniff fallback. Runs when the alias resolver missed or
+      //     was rejected in (b). Scans every column for TDS code patterns,
+      //     picks the highest-scoring column.
+      if (verified.tdsSection < 0) {
+        let bestIdx = -1;
+        let bestScore = 0;
+        const colWidth = headers.length;
+        for (let colIdx = 0; colIdx < colWidth; colIdx++) {
+          const { codeHits, flagHits, nonEmpty } = scanColumn(colIdx);
+          if (codeHits < MIN_SNIFF_HITS) continue;
+          if (flagHits >= codeHits) continue; // Yes/No-dominated — skip
+          // Heavier weight on TDS-code hits; light penalty for flag noise;
+          // tiny bonus when the column is consistently filled.
+          const score =
+            codeHits * 2 -
+            flagHits +
+            (nonEmpty >= dataSample.length / 2 ? 1 : 0);
+          if (score > bestScore) {
+            bestScore = score;
+            bestIdx = colIdx;
+          }
+        }
+
+        if (bestIdx >= 0) {
+          const colName = String(headers[bestIdx] ?? '').replace(/\s+/g, ' ').trim();
+          this.logger.log(
+            `[P2P] tdsSection → col ${String(bestIdx + 1).padStart(3)} ` +
+              `("${colName}") [content-sniff: values match TDS code pattern, ` +
+              `score=${bestScore}]`,
+          );
+          verified.tdsSection = bestIdx;
+          verifiedCanonical.tdsSection = bestIdx;
+          map.tds = bestIdx;
+        } else {
+          this.logger.warn(
+            `[P2P] tdsSection content-sniff found no column whose data looks ` +
+              `like TDS section codes (393(1)_*, 194C, 195_*) in the first ` +
+              `${dataSample.length} sampled rows. tdsSection will be empty.`,
+          );
+        }
+      }
+    }
+
+    // P2P-only: explicit source annotation for fields that can come from either
+    // a direct column (new file format) or the statutory matrix (old file
+    // format). Helps debug whichever file format is being parsed today.
+    if (source === 'P2P') {
+      const snameIdx = map.sname ?? -1;
+      const svalIdx = map.sval ?? -1;
+      const matrixOk = snameIdx >= 0 && svalIdx >= 0;
+      const annotate = (field: 'pan' | 'gstin' | 'msme', directIdx: number) => {
+        if (directIdx >= 0) {
+          const colName = String(headers[directIdx] ?? '').replace(/\s+/g, ' ').trim();
+          this.logger.log(
+            `[P2P] ${field.padEnd(12)} → DIRECT col ${String(directIdx + 1).padStart(3)} ("${colName}")`,
+          );
+        } else if (matrixOk) {
+          this.logger.log(
+            `[P2P] ${field.padEnd(12)} → MATRIX (Statutory Name + Value columns)`,
+          );
+        } else {
+          this.logger.warn(
+            `[P2P] ${field.padEnd(12)} → UNAVAILABLE (no direct column and no statutory matrix)`,
+          );
+        }
+      };
+      annotate('pan', map.panNumber ?? -1);
+      annotate('gstin', map.gstNumber ?? -1);
+      // MSME is intentionally matrix-only — we never wire a direct column. Skip
+      // the UNAVAILABLE warning for it; absent MSME is fine.
+      if (matrixOk) {
+        this.logger.log(`[P2P] msme         → MATRIX (Statutory Name + Value columns)`);
+      } else {
+        this.logger.log(`[P2P] msme         → out of scope on this file (no matrix present)`);
+      }
+    }
 
     return { map, warnings, verifiedCanonical };
   }

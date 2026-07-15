@@ -103,7 +103,7 @@ sudo ln -sf /etc/nginx/sites-available/autoreco.indiraivf.in.conf /etc/nginx/sit
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
-Set `PORT=8001` in `backend/.env`. Update the `root` path in the nginx file if the repo is not at `/home/aiadmin/vendor_latest`.
+Set `PORT=8001` in `backend/.env`. Default nginx `root`: `/home/aiadmin/vendor-master/vendor-reco-automation/frontend/dist`.
 
 ## Environment Variables
 

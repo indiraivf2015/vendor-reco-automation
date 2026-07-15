@@ -1,30 +1,21 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import {
-  exceptionsApi, ReconException, reconApi,
+  exceptionsApi, ReconException, reconApi, reportsApi,
   GroupedExceptionVendorBlock, GroupedExceptionMismatch,
 } from '../services/api';
+import { MISMATCH_CATEGORIES, isDrillableType, typeToLabel } from '../services/categoryTypes';
 import { Card, Button, PageHeader, EmptyState, SeverityBadge, StatusBadge, TableSkeleton } from '../components/ui';
-import { Search, X, ChevronDown, ChevronRight } from 'lucide-react';
+import { Search, X, ChevronDown, ChevronRight, Download, Loader2 } from 'lucide-react';
 import clsx from 'clsx';
+import { toast } from '../components/Toast';
 
 const SEVERITIES = ['', 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW'];
 const STATUSES = ['', 'OPEN', 'IN_REVIEW', 'RESOLVED', 'IGNORED'];
 
-/** Matches dashboard "Category-wise Reconciliation Summary" rows + presence exceptions */
-const MISMATCH_CATEGORIES: { label: string; value: string; hint?: string }[] = [
-  { label: 'All categories', value: '' },
-  { label: 'Vendor Name', value: 'VENDOR_NAME_MISMATCH' },
-  { label: 'PAN', value: 'PAN_MISMATCH' },
-  { label: 'GST', value: 'GST_MISMATCH' },
-  { label: 'MSME', value: 'MSME_MISMATCH' },
-  { label: 'IFSC', value: 'IFSC_MISMATCH' },
-  { label: 'Bank Account', value: 'BANK_ACCOUNT_MISMATCH' },
-  { label: 'Bank Name', value: 'BANK_NAME_MISMATCH' },
-  { label: 'TDS', value: 'TDS_MISMATCH' },
-  { label: 'Missing in ERP (vendor)', value: 'MISSING_IN_ERP', hint: 'Vendor in P2P only' },
-  { label: 'Missing in P2P (vendor)', value: 'MISSING_IN_P2P', hint: 'Vendor in ERP only' },
-];
+/** Query-string key used for deep-linking the category filter from the Dashboard. */
+const TYPE_PARAM = 'type';
 
 const PAGE_SIZE = 20;
 const GROUP_PAGE_SIZE = 50;
@@ -133,6 +124,7 @@ function PanMismatchDrawerPanel({ ex }: { ex: ReconException }) {
 
 export default function Exceptions() {
   const qc = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [viewMode, setViewMode] = useState<ViewMode>('flat');
   const [q, setQ] = useState('');
   const [severity, setSeverity] = useState('');
@@ -143,14 +135,69 @@ export default function Exceptions() {
   const [newStatus, setNewStatus] = useState('');
   const [expandedBlocks, setExpandedBlocks] = useState<Set<string>>(() => new Set());
 
-  const [categoryType, setCategoryType] = useState('');
+  // Initialize categoryType from URL ?type=... so deep links from the Dashboard work.
+  const initialType = (() => {
+    const raw = searchParams.get(TYPE_PARAM) || '';
+    return MISMATCH_CATEGORIES.some((c) => c.value === raw) ? raw : '';
+  })();
+  const [categoryType, setCategoryType] = useState(initialType);
   const [scopeLatestRun, setScopeLatestRun] = useState(true);
+  const [exportingCategory, setExportingCategory] = useState(false);
 
   const { data: runs, isFetched: runsFetched } = useQuery({
     queryKey: ['latestRun'],
     queryFn: reconApi.listRuns,
   });
   const latestRunId = runs?.[0]?.id;
+
+  /**
+   * Keep ?type=... in sync with the categoryType filter state so:
+   *   - reloading preserves the view
+   *   - sharing the URL works
+   *   - the browser back/forward buttons navigate filter history naturally
+   */
+  useEffect(() => {
+    const current = searchParams.get(TYPE_PARAM) || '';
+    if (current === categoryType) return;
+    const next = new URLSearchParams(searchParams);
+    if (categoryType) next.set(TYPE_PARAM, categoryType);
+    else next.delete(TYPE_PARAM);
+    setSearchParams(next, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [categoryType]);
+
+  /**
+   * React to external URL changes (e.g. a fresh deep-link from the Dashboard
+   * after the page is already mounted, or browser back/forward).
+   */
+  useEffect(() => {
+    const raw = searchParams.get(TYPE_PARAM) || '';
+    const next = MISMATCH_CATEGORIES.some((c) => c.value === raw) ? raw : '';
+    if (next !== categoryType) {
+      setCategoryType(next);
+      setPage(1);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
+
+  /** Active run id used by the "Export this category" button. */
+  const activeRunId = scopeLatestRun ? (latestRunId || 'latest') : 'latest';
+  const canExportCategory = isDrillableType(categoryType);
+
+  async function handleExportCategory() {
+    if (!canExportCategory || exportingCategory) return;
+    setExportingCategory(true);
+    const label = typeToLabel(categoryType);
+    toast.info(`Generating "${label}" worklist… large categories can take a few seconds.`);
+    try {
+      const filename = await reportsApi.exportCategory(activeRunId, categoryType);
+      toast.success(`Downloaded ${filename}`);
+    } catch (e: any) {
+      toast.error(e?.message || 'Category export failed. Try again or check server logs.');
+    } finally {
+      setExportingCategory(false);
+    }
+  }
 
   const filterParams = {
     q: q || undefined,
@@ -276,6 +323,25 @@ export default function Exceptions() {
         )}
         {scopeLatestRun && runsFetched && !latestRunId && (
           <span className="text-xs text-amber-700 pb-0.5">No reconciliation run yet — showing all exceptions</span>
+        )}
+        {canExportCategory && (
+          <span
+            title={`Download an Excel worklist of "${typeToLabel(categoryType)}" mismatches for the active run`}
+          >
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={handleExportCategory}
+              disabled={exportingCategory}
+            >
+              {exportingCategory ? (
+                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <Download className="w-3.5 h-3.5" />
+              )}
+              {exportingCategory ? 'Generating…' : 'Export this category'}
+            </Button>
+          </span>
         )}
       </div>
 

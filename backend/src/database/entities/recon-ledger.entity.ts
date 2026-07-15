@@ -48,6 +48,10 @@ export class ReconLedger {
   @Column({ length: 200, nullable: true }) tdsErp: string;
   @Column({ default: false }) tdsMatch: boolean;
 
+  @Column({ length: 100, nullable: true }) paymentTermP2p: string;
+  @Column({ length: 100, nullable: true }) paymentTermErp: string;
+  @Column({ default: false }) paymentTermMatch: boolean;
+
   @Column({ default: true }) presentInP2p: boolean;
   @Column({ default: true }) presentInErp: boolean;
   @Column({ default: 0 }) mismatchCount: number;

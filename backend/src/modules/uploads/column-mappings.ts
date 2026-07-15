@@ -15,7 +15,8 @@ export type CanonicalField =
   | 'bankAccount'
   | 'bankName'
   | 'ifscCode'
-  | 'tdsSection';
+  | 'tdsSection'
+  | 'paymentTerm';
 
 export const ALL_CANONICAL_FIELDS: CanonicalField[] = [
   'vendorCode',
@@ -29,6 +30,7 @@ export const ALL_CANONICAL_FIELDS: CanonicalField[] = [
   'bankName',
   'ifscCode',
   'tdsSection',
+  'paymentTerm',
 ];
 
 export const P2P_COLUMN_ALIASES: Record<CanonicalField, string[]> = {
@@ -42,7 +44,15 @@ export const P2P_COLUMN_ALIASES: Record<CanonicalField, string[]> = {
   bankAccount: ['Bank Ref', 'Bank Reference', 'BankRef', 'Bank Account'],
   bankName: ['Bank Name', 'BankName'],
   ifscCode: ['IFSCCode', 'IFSC Code', 'IFSC'],
-  tdsSection: ['TDS\nSection', 'TDS Section', 'TDSSection', 'TDS'],
+  // The bare 'TDS' alias is safe here: P2P resolveColumns runs a
+  // content-sniff after the alias match. If the alias lands on a Yes/No
+  // flag column (old Master Vendor report has one literally named "TDS"),
+  // the sniff rejects it and re-binds to the column whose values actually
+  // match TDS section code patterns (e.g. 393(1)_CONTRACT, 194C, 195_10).
+  // The bare alias gives the sniff a starting hint when the header is just
+  // "TDS" (as in the new VendorMasterReport.xlsx).
+  tdsSection: ['TDS\nSection', 'TDS Section', 'TDSSection', 'TDS Section No.', 'TDS Section No', 'TDS'],
+  paymentTerm: ['PayTerm', 'Pay Term', 'Payment Term', 'PAYMENT TERM', 'Payment Terms'],
 };
 
 export const ERP_COLUMN_ALIASES: Record<CanonicalField, string[]> = {
@@ -58,6 +68,7 @@ export const ERP_COLUMN_ALIASES: Record<CanonicalField, string[]> = {
   bankName: ['BANK_NAME_S', 'BANK_NAME', 'Bank Name'],
   ifscCode: ['BRANCH_NUM_S', 'BRANCH_NUMBER', 'IFSC', 'IFSC Code'],
   tdsSection: ['WITHHOLD_TAX_GRP', 'TDS Section', 'TDS Group'],
+  paymentTerm: ['PAYMENT_TERM', 'PAYMENT_TERM_S', 'PAYMENT_TERMS', 'PAYMENT TERMS', 'Payment Term', 'Payment Terms', 'TERMS_NAME'],
 };
 
 /** Lowercase, trim, collapse whitespace (incl. newlines) to single spaces. */
@@ -92,6 +103,10 @@ export function resolveAllColumns(
   }
   const skip = new Set(options?.skipFields ?? []);
 
+  // Pre-compute normalized headers once so we can cheaply count duplicates per
+  // resolved label without re-normalizing inside the loop.
+  const normalizedHeaders = header.map(normalizeHeaderLabel);
+
   for (const field of ALL_CANONICAL_FIELDS) {
     if (skip.has(field)) continue;
     const aliases = aliasMap[field];
@@ -105,6 +120,24 @@ export function resolveAllColumns(
       logger?.log(
         `[${sourceLabel}] ${field.padEnd(12)} → col ${colOneBased} ("${colName}")`,
       );
+
+      // Defensive: warn when a resolved required-field label appears more than
+      // once. resolveColumnIndex returned the first occurrence; the remaining
+      // copies are ignored, which is almost always desirable but worth surfacing
+      // so an upstream rename doesn't go unnoticed.
+      const matchedKey = normalizedHeaders[idx];
+      if (matchedKey) {
+        const occurrences = normalizedHeaders.reduce(
+          (n, h) => (h === matchedKey ? n + 1 : n),
+          0,
+        );
+        if (occurrences > 1) {
+          logger?.warn(
+            `[${sourceLabel}] ⚠️  Required column "${colName}" (${field}) ` +
+              `appears ${occurrences} times; using first occurrence at col ${colOneBased.trim()}`,
+          );
+        }
+      }
     } else {
       logger?.warn(
         `[${sourceLabel}] ${field.padEnd(12)} → NOT FOUND. Tried: ${aliases.join(' | ')}`,

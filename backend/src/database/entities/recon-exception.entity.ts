@@ -13,7 +13,8 @@ export type ExceptionType =
   | 'IFSC_MISMATCH'
   | 'BANK_ACCOUNT_MISMATCH'
   | 'BANK_NAME_MISMATCH'
-  | 'TDS_MISMATCH';
+  | 'TDS_MISMATCH'
+  | 'PAYMENT_TERM_MISMATCH';
 
 export type ExceptionSeverity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW';
 export type ExceptionStatus = 'OPEN' | 'IN_REVIEW' | 'RESOLVED' | 'IGNORED';

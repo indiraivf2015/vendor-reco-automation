@@ -56,6 +56,7 @@ export interface LedgerRow {
   bankAccountP2p: string; bankAccountErp: string; bankAccountMatch: boolean;
   bankNameP2p: string; bankNameErp: string; bankNameMatch: boolean;
   tdsP2p: string; tdsErp: string; tdsMatch: boolean;
+  paymentTermP2p: string; paymentTermErp: string; paymentTermMatch: boolean;
   presentInP2p: boolean;
   presentInErp: boolean;
   mismatchCount: number;
@@ -259,23 +260,78 @@ export const auditApi = {
   list: () => api.get<AuditEntry[]>('/audit').then(r => r.data),
 };
 
+/**
+ * Reads a blob as text — used to surface JSON error bodies from servers that
+ * still respond 4xx/5xx with a body when the client asked for `responseType: 'blob'`.
+ */
+async function blobToText(blob: Blob): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result || ''));
+    reader.onerror = () => reject(reader.error);
+    reader.readAsText(blob);
+  });
+}
+
+/**
+ * Robust XLSX download trigger that works across Chrome/Edge/Firefox:
+ *  - validates content-type (so a JSON error doesn't get saved as .xlsx)
+ *  - appends <a> to the DOM before .click() (Firefox needs this)
+ *  - defers revokeObjectURL until after the browser starts the download
+ */
+async function saveXlsxResponse(
+  r: { data: Blob; headers: Record<string, any> },
+  fallbackFilename: string,
+) {
+  const ct = String(r.headers?.['content-type'] || '').toLowerCase();
+  if (!ct.includes('spreadsheet') && !ct.includes('octet-stream')) {
+    const text = await blobToText(r.data).catch(() => '');
+    let msg = 'Report download failed.';
+    try {
+      const j = JSON.parse(text);
+      if (j?.message) msg = `Report download failed: ${j.message}`;
+    } catch { /* not JSON */ }
+    throw new Error(msg);
+  }
+
+  // Pull filename from Content-Disposition if available.
+  const cd = String(r.headers?.['content-disposition'] || '');
+  const m = /filename\*?=(?:UTF-8'')?["']?([^"';]+)/i.exec(cd);
+  const filename = (m?.[1] || fallbackFilename).trim();
+
+  const url = URL.createObjectURL(r.data);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  a.style.display = 'none';
+  document.body.appendChild(a);
+  a.click();
+  setTimeout(() => {
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }, 1000);
+  return filename;
+}
+
 export const reportsApi = {
-  downloadLatest: () => api.get('/reports/latest.xlsx', { responseType: 'blob' }).then(r => {
-    const url = URL.createObjectURL(r.data);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'vendor_recon_latest.xlsx';
-    a.click();
-    URL.revokeObjectURL(url);
-  }),
-  downloadRun: (id: string) => api.get(`/reports/runs/${id}.xlsx`, { responseType: 'blob' }).then(r => {
-    const url = URL.createObjectURL(r.data);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `vendor_recon_${id.slice(0, 8)}.xlsx`;
-    a.click();
-    URL.revokeObjectURL(url);
-  }),
+  downloadLatest: () =>
+    api
+      .get('/reports/latest.xlsx', { responseType: 'blob' })
+      .then((r) => saveXlsxResponse(r as any, 'vendor_recon_latest.xlsx')),
+  downloadRun: (id: string) =>
+    api
+      .get(`/reports/runs/${id}.xlsx`, { responseType: 'blob' })
+      .then((r) => saveXlsxResponse(r as any, `vendor_recon_${id.slice(0, 8)}.xlsx`)),
+  /**
+   * Focused per-category Excel for a single run. Pass runId='latest' to resolve
+   * to the most recent completed run server-side.
+   */
+  exportCategory: (runId: string, type: string) =>
+    api
+      .get(`/reports/category/${encodeURIComponent(runId)}/${encodeURIComponent(type)}.xlsx`, {
+        responseType: 'blob',
+      })
+      .then((r) => saveXlsxResponse(r as any, `${type.toLowerCase()}_${runId.slice(0, 8)}.xlsx`)),
 };
 
 export default api;

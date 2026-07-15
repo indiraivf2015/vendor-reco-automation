@@ -11,7 +11,7 @@ import {
 } from '../../database/entities/recon-exception.entity';
 import { NotificationsService } from '../notifications/notifications.service';
 import { AuditService } from '../audit/audit.service';
-import { fieldEquals, isEmpty, n, nName, nUpper, nPan, nAccount } from '../../common/normalize.util';
+import { fieldEquals, isEmpty, n, nName, nUpper, nPan, nAccount, nPayTerm, nTds } from '../../common/normalize.util';
 
 type FieldRule = {
   category: string;
@@ -30,7 +30,8 @@ const RULES: FieldRule[] = [
   { category: 'IFSC',         p2pField: 'ifscCode',    erpField: 'ifscCode',         exceptionType: 'IFSC_MISMATCH',         severity: 'HIGH',     normalize: nUpper },
   { category: 'Bank Account', p2pField: 'bankAccount', erpField: 'bankAccount',      exceptionType: 'BANK_ACCOUNT_MISMATCH', severity: 'CRITICAL', normalize: nAccount },
   { category: 'Bank Name',    p2pField: 'bankName',    erpField: 'bankName',         exceptionType: 'BANK_NAME_MISMATCH',    severity: 'MEDIUM',   normalize: nName },
-  { category: 'TDS',          p2pField: 'tdsSection',  erpField: 'withholdTaxGroup', exceptionType: 'TDS_MISMATCH',          severity: 'LOW',      normalize: nUpper },
+  { category: 'TDS',          p2pField: 'tdsSection',  erpField: 'withholdTaxGroup', exceptionType: 'TDS_MISMATCH',          severity: 'LOW',      normalize: nTds },
+  { category: 'Payment Term', p2pField: 'payTerm',     erpField: 'paymentTerm',      exceptionType: 'PAYMENT_TERM_MISMATCH', severity: 'HIGH',     normalize: nPayTerm },
 ];
 
 @Injectable()
@@ -75,7 +76,34 @@ export class ReconciliationService {
     });
 
     try {
-      const [p2pVendors, erpVendors] = await Promise.all([this.p2pRepo.find(), this.erpRepo.find()]);
+      // Active-only reconciliation: skip inactive vendors on both sides so the
+      // recon set reflects vendors that can still transact today.
+      //  - P2P: activeStatus must be an explicit "yes"/"active" variant
+      //    (case-insensitive). NULL / blank / "No" rows are excluded.
+      //  - ERP: status must be "Active" AND endDateActive (if set) must be in
+      //    the future. Both conditions guard against tombstoned vendors.
+      const [p2pVendors, erpVendors, p2pTotal, erpTotal] = await Promise.all([
+        this.p2pRepo
+          .createQueryBuilder('v')
+          .where('LOWER(TRIM(v.activeStatus)) IN (:...active)', {
+            active: ['yes', 'y', 'active', 'true', '1'],
+          })
+          .getMany(),
+        this.erpRepo
+          .createQueryBuilder('v')
+          .where('LOWER(TRIM(v.status)) = :a', { a: 'active' })
+          .andWhere('(v.endDateActive IS NULL OR v.endDateActive > CURRENT_TIMESTAMP)')
+          .getMany(),
+        this.p2pRepo.count(),
+        this.erpRepo.count(),
+      ]);
+      this.logger.log(
+        `[Recon] Active filter: P2P ${p2pTotal}→${p2pVendors.length} ` +
+          `(${p2pTotal - p2pVendors.length} inactive excluded), ` +
+          `ERP ${erpTotal}→${erpVendors.length} ` +
+          `(${erpTotal - erpVendors.length} inactive)`,
+      );
+
       const { ledger, exceptions, summary } = this.compare(p2pVendors, erpVendors, run.id);
 
       await this.saveChunked(this.ledgerRepo, ledger, 200);
@@ -224,6 +252,7 @@ export class ReconciliationService {
         bankAccountP2p: p2p?.bankAccount, bankAccountErp: erp?.bankAccount,
         bankNameP2p: p2p?.bankName,     bankNameErp: erp?.bankName,
         tdsP2p: p2p?.tdsSection,        tdsErp: erp?.withholdTaxGroup,
+        paymentTermP2p: p2p?.payTerm,   paymentTermErp: erp?.paymentTerm,
       } as Partial<ReconLedger>);
 
       row.vendorCodeMatch = fieldEquals(p2p?.vendorCode, erp?.vendorCode, n);
@@ -281,6 +310,7 @@ export class ReconciliationService {
       this.summaryFor('Bank Account', ledger, runId, (l) => l.bankAccountP2p, (l) => l.bankAccountErp, (l) => l.bankAccountMatch),
       this.summaryFor('Bank Name',    ledger, runId, (l) => l.bankNameP2p,    (l) => l.bankNameErp,    (l) => l.bankNameMatch),
       this.summaryFor('TDS',          ledger, runId, (l) => l.tdsP2p,         (l) => l.tdsErp,         (l) => l.tdsMatch),
+      this.summaryFor('Payment Term', ledger, runId, (l) => l.paymentTermP2p, (l) => l.paymentTermErp, (l) => l.paymentTermMatch),
     ];
     return { ledger, summary, exceptions };
   }
@@ -319,6 +349,7 @@ export class ReconciliationService {
     const map: Record<string, string> = {
       'Vendor Name': 'vendorName', PAN: 'pan', GST: 'gst', MSME: 'msme',
       IFSC: 'ifsc', 'Bank Account': 'bankAccount', 'Bank Name': 'bankName', TDS: 'tds',
+      'Payment Term': 'paymentTerm',
     };
     return map[category];
   }

@@ -2,6 +2,7 @@ import { Controller, Get, Param, Res } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { Response } from 'express';
 import { ReportsService } from './reports.service';
+import { ExceptionType } from '../../database/entities/recon-exception.entity';
 
 @ApiTags('reports')
 @Controller('reports')
@@ -17,6 +18,21 @@ export class ReportsController {
   @Get('runs/:id.xlsx')
   async byRun(@Param('id') id: string, @Res() res: Response) {
     const { buffer, filename } = await this.svc.generateRunReport(id);
+    this.send(res, buffer, filename);
+  }
+
+  /**
+   * Focused per-category Excel export.
+   * runId may be a UUID or the literal "latest" to use the most recent completed run.
+   * type is one of the ExceptionType string literals (e.g. PAYMENT_TERM_MISMATCH).
+   */
+  @Get('category/:runId/:type.xlsx')
+  async byCategory(
+    @Param('runId') runId: string,
+    @Param('type') type: string,
+    @Res() res: Response,
+  ) {
+    const { buffer, filename } = await this.svc.generateCategoryReport(runId, type as ExceptionType);
     this.send(res, buffer, filename);
   }
 

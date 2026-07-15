@@ -42,7 +42,7 @@ import { JobsModule } from './modules/jobs/jobs.module';
           entities: [
             P2pVendor,
             ErpVendor,
-            ReconRun,
+            ReconRun,  
             ReconLedger,
             ReconCategorySummary,
             ReconException,

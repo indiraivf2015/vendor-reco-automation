@@ -2,19 +2,35 @@ import { useState, useMemo, useEffect } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { reconApi, reportsApi, ReconRun } from '../services/api';
 import { Card, PageHeader, EmptyState, StatusBadge, Button, TableSkeleton } from '../components/ui';
-import { Download } from 'lucide-react';
+import { Download, Loader2 } from 'lucide-react';
 import { format } from 'date-fns';
 import clsx from 'clsx';
+import { toast } from '../components/Toast';
 
 const PAGE_SIZE = 20;
 const TABLE_MAX_H = 'max-h-[min(70vh,560px)]';
 
 export default function Runs() {
   const [page, setPage] = useState(1);
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
   const { data, isLoading } = useQuery<ReconRun[]>({
     queryKey: ['runs'],
     queryFn: reconApi.listRuns,
   });
+
+  async function handleDownload(runId: string) {
+    if (downloadingId) return;
+    setDownloadingId(runId);
+    toast.info('Generating Excel report… large runs can take 30–90 seconds.');
+    try {
+      const filename = await reportsApi.downloadRun(runId);
+      toast.success(`Downloaded ${filename}`);
+    } catch (e: any) {
+      toast.error(e?.message || 'Report download failed. Try again or check server logs.');
+    } finally {
+      setDownloadingId(null);
+    }
+  }
 
   const rows = data ?? [];
   const total = rows.length;
@@ -77,8 +93,17 @@ export default function Runs() {
                   </td>
                   <td className="px-4 py-2.5 text-center">
                     {r.status === 'COMPLETED' && (
-                      <Button variant="ghost" size="sm" onClick={() => reportsApi.downloadRun(r.id)}>
-                        <Download className="w-3.5 h-3.5" />
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleDownload(r.id)}
+                        disabled={downloadingId !== null}
+                      >
+                        {downloadingId === r.id ? (
+                          <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <Download className="w-3.5 h-3.5" />
+                        )}
                       </Button>
                     )}
                   </td>

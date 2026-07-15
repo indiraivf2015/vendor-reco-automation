@@ -5,8 +5,30 @@ import * as ExcelJS from 'exceljs';
 import { ReconRun } from '../../database/entities/recon-run.entity';
 import { ReconLedger } from '../../database/entities/recon-ledger.entity';
 import { ReconCategorySummary } from '../../database/entities/recon-category-summary.entity';
-import { ReconException } from '../../database/entities/recon-exception.entity';
+import { ReconException, ExceptionType } from '../../database/entities/recon-exception.entity';
 import { groupExceptions, formatGroupHeader } from '../exceptions/exception-grouping.util';
+import {
+  applyListFilters, EXCEPTION_SEVERITY_ORDER_SQL,
+} from '../exceptions/exceptions-filter.util';
+
+/**
+ * Friendly labels for category-focused exports. Keep in sync with
+ * frontend/src/services/categoryTypes.ts (MISMATCH_CATEGORIES) and
+ * reconciliation.service.ts (RULES[].category).
+ */
+const CATEGORY_TYPE_LABELS: Record<string, string> = {
+  VENDOR_NAME_MISMATCH:  'Vendor Name',
+  PAN_MISMATCH:          'PAN',
+  GST_MISMATCH:          'GST',
+  MSME_MISMATCH:         'MSME',
+  IFSC_MISMATCH:         'IFSC',
+  BANK_ACCOUNT_MISMATCH: 'Bank Account',
+  BANK_NAME_MISMATCH:    'Bank Name',
+  TDS_MISMATCH:          'TDS',
+  PAYMENT_TERM_MISMATCH: 'Payment Term',
+  MISSING_IN_ERP:        'Missing in ERP',
+  MISSING_IN_P2P:        'Missing in P2P',
+};
 
 @Injectable()
 export class ReportsService {
@@ -106,6 +128,9 @@ export class ReportsService {
       { header: 'TDS P2P', key: 'tp', width: 24 },
       { header: 'TDS ERP', key: 'te', width: 24 },
       { header: 'Status', key: 'ts', width: 9 },
+      { header: 'Payment Term P2P', key: 'ptp', width: 18 },
+      { header: 'Payment Term ERP', key: 'pte', width: 18 },
+      { header: 'Status', key: 'pts', width: 9 },
     ];
     ledger.forEach((l, idx) => {
       vm.addRow({
@@ -119,10 +144,11 @@ export class ReportsService {
         bap: l.bankAccountP2p, bae: l.bankAccountErp, bas: l.bankAccountMatch,
         bnp: l.bankNameP2p, bne: l.bankNameErp, bns: l.bankNameMatch,
         tp: l.tdsP2p, te: l.tdsErp, ts: l.tdsMatch,
+        ptp: l.paymentTermP2p, pte: l.paymentTermErp, pts: l.paymentTermMatch,
       });
     });
     this.styleHeader(vm);
-    this.colourBoolColumns(vm, ['vns', 'vcs', 'ps', 'gs', 'ms', 'is', 'bas', 'bns', 'ts'], ledger.length);
+    this.colourBoolColumns(vm, ['vns', 'vcs', 'ps', 'gs', 'ms', 'is', 'bas', 'bns', 'ts', 'pts'], ledger.length);
 
     // ----- Exceptions sheet -----
     const ex = wb.addWorksheet('Exceptions');
@@ -155,6 +181,84 @@ export class ReportsService {
     const latest = await this.runRepo.findOne({ where: { status: 'COMPLETED' }, order: { startedAt: 'DESC' } });
     if (!latest) throw new NotFoundException('No completed run available yet.');
     return this.generateRunReport(latest.id);
+  }
+
+  /**
+   * Focused, single-sheet Excel of mismatches for a single category in a single run.
+   * `runId` accepts the literal string "latest" to resolve to the most recent
+   * completed run (mirrors /reports/latest.xlsx semantics).
+   */
+  async generateCategoryReport(
+    runId: string,
+    exceptionType: ExceptionType,
+  ): Promise<{ buffer: Buffer; filename: string }> {
+    if (!CATEGORY_TYPE_LABELS[exceptionType]) {
+      throw new NotFoundException(`Unknown exception type "${exceptionType}"`);
+    }
+
+    let run: ReconRun | null;
+    if (runId === 'latest') {
+      run = await this.runRepo.findOne({
+        where: { status: 'COMPLETED' }, order: { startedAt: 'DESC' },
+      });
+      if (!run) throw new NotFoundException('No completed run available yet.');
+    } else {
+      run = await this.runRepo.findOne({ where: { id: runId } });
+      if (!run) throw new NotFoundException(`Run ${runId} not found`);
+    }
+
+    const qb = this.exRepo.createQueryBuilder('e');
+    applyListFilters(qb, { runId: run.id, type: exceptionType });
+    qb.orderBy(EXCEPTION_SEVERITY_ORDER_SQL, 'ASC')
+      .addOrderBy('e.vendorCode', 'ASC');
+    const exceptions = await qb.getMany();
+
+    const categoryLabel = CATEGORY_TYPE_LABELS[exceptionType];
+    const sheetTitle = `${categoryLabel} Mismatches`.slice(0, 31);
+
+    const wb = new ExcelJS.Workbook();
+    wb.creator = 'Indira IVF • Vendor Recon Automation';
+    wb.created = new Date();
+
+    const ws = wb.addWorksheet(sheetTitle);
+    // Severity column uses key 's' to reuse the existing applySeverityColours helper.
+    ws.columns = [
+      { header: 'Vendor Code', key: 'vc', width: 16 },
+      { header: 'City',        key: 'ct', width: 18 },
+      { header: 'Vendor Name', key: 'vn', width: 32 },
+      { header: 'P2P Value',   key: 'p',  width: 28 },
+      { header: 'ERP Value',   key: 'e',  width: 28 },
+      { header: 'Severity',    key: 's',  width: 12 },
+      { header: 'Status',      key: 'st', width: 12 },
+    ];
+
+    exceptions.forEach((e) => ws.addRow({
+      vc: e.vendorCode,
+      ct: e.city || 'UNSPECIFIED',
+      vn: e.vendorName,
+      p:  e.p2pValue,
+      e:  e.erpValue,
+      s:  e.severity,
+      st: e.status,
+    }));
+
+    this.styleHeader(ws);
+    this.applySeverityColours(ws, exceptions);
+    ws.views = [{ state: 'frozen', ySplit: 1 }];
+
+    const buffer = (await wb.xlsx.writeBuffer()) as unknown as Buffer;
+    const dt = this.formatDateForFilename(new Date(run.startedAt));
+    const safeLabel = categoryLabel.replace(/\s+/g, '_');
+    const filename = `${safeLabel}_Mismatches_${dt}.xlsx`;
+    return { buffer, filename };
+  }
+
+  private formatDateForFilename(d: Date): string {
+    const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+    const dd = String(d.getDate()).padStart(2, '0');
+    const mmm = months[d.getMonth()];
+    const yyyy = d.getFullYear();
+    return `${dd}-${mmm}-${yyyy}`;
   }
 
   private styleHeader(ws: ExcelJS.Worksheet) {
